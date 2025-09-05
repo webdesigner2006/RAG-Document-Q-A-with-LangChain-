@@ -6,114 +6,118 @@ from langchain_community.embeddings import HuggingFaceInstructEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain.chains import RetrievalQA
 from langchain_community.llms import HuggingFaceHub
+from dotenv import load_dotenv
+
+# --- Constants ---
+# Using instructor-base is a good trade-off between performance and size.
+EMBEDDING_MODEL_NAME = "hkunlp/instructor-base" 
+# Mistral-7B is a powerful open-source model.
+LLM_REPO_ID = "mistralai/Mistral-7B-Instruct-v0.2"
+TEMP_DOCS_DIR = "documents"
 
 # --- App Configuration ---
 st.set_page_config(page_title="📄 Chat with Your Document", layout="wide")
-st.title("📄 Chat with Your Document using RAG")
+st.header("📄 Chat with Your Document")
 
-# --- Hugging Face API Token ---
-# It's recommended to set this as an environment variable for security
-HUGGINGFACEHUB_API_TOKEN = st.secrets.get("HUGGINGFACEHUB_API_TOKEN")
+# --- API Key Management ---
+load_dotenv()
+hf_api_token = os.getenv("HUGGINGFACEHUB_API_TOKEN")
 
-if not HUGGINGFACEHUB_API_TOKEN:
-    try:
-        # A more secure way to get the token if running locally
-        from dotenv import load_dotenv
-        load_dotenv()
-        HUGGINGFACEHUB_API_TOKEN = os.getenv("HUGGINGFACEHUB_API_TOKEN")
-    except ImportError:
-        pass # If dotenv is not installed, we'll rely on the text input
-
-if not HUGGINGFACEHUB_API_TOKEN:
-    st.warning("Hugging Face API Token not found. Please enter it below.")
-    HUGGINGFACEHUB_API_TOKEN = st.text_input("Enter your Hugging Face API Token:", type="password")
-
-if HUGGINGFACEHUB_API_TOKEN:
-    os.environ["HUGGINGFACEHUB_API_TOKEN"] = HUGGINGFACEHUB_API_TOKEN
-else:
-    st.stop()
-
+if not hf_api_token:
+    st.warning("Hugging Face API Token not found in .env file.")
+    hf_api_token = st.text_input(
+        "Please enter your Hugging Face API Token:", type="password", key="api_token_input"
+    )
+    if hf_api_token:
+        os.environ["HUGGINGFACEHUB_API_TOKEN"] = hf_api_token
+    else:
+        st.stop()
 
 # --- Caching Functions for Performance ---
 @st.cache_resource
 def load_embeddings():
     """Loads the sentence transformer model for embeddings."""
-    # Using a smaller, faster model for demonstration
-    return HuggingFaceInstructEmbeddings(model_name="hkunlp/instructor-base")
+    return HuggingFaceInstructEmbeddings(model_name=EMBEDDING_MODEL_NAME)
 
 @st.cache_resource
 def load_llm():
     """Loads the language model from Hugging Face Hub."""
-    # Example model: Mistral-7B Instruct
     return HuggingFaceHub(
-        repo_id="mistralai/Mistral-7B-Instruct-v0.2",
-        model_kwargs={"temperature": 0.1, "max_length": 1024}
+        repo_id=LLM_REPO_ID,
+        model_kwargs={"temperature": 0.1, "max_new_tokens": 1024}
     )
 
-@st.cache_data(show_spinner="Processing PDF...")
-def process_pdf(uploaded_file):
-    """Loads and processes the PDF, creating a vector store."""
-    if uploaded_file is not None:
-        # Save the uploaded file temporarily to be read by PyPDFLoader
-        temp_file_path = os.path.join("documents", uploaded_file.name)
-        os.makedirs("documents", exist_ok=True)
+# This function is now cached to avoid reprocessing the same file.
+# The key is the file's content, so it re-runs if a new file is uploaded.
+@st.cache_data(show_spinner="Analyzing document...")
+def process_pdf(_uploaded_file):
+    """Loads, splits, and embeds the PDF, creating a FAISS vector store."""
+    if _uploaded_file is not None:
+        # Create a temporary directory to store the file
+        os.makedirs(TEMP_DOCS_DIR, exist_ok=True)
+        temp_file_path = os.path.join(TEMP_DOCS_DIR, _uploaded_file.name)
+        
         with open(temp_file_path, "wb") as f:
-            f.write(uploaded_file.getbuffer())
+            f.write(_uploaded_file.getbuffer())
 
         # 1. Load the document
         loader = PyPDFLoader(temp_file_path)
         documents = loader.load()
 
-        # 2. Split the document into chunks
+        # 2. Split the doc into smaller chunks.
+        # This is crucial for the LLM to find relevant context.
         text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
         texts = text_splitter.split_documents(documents)
 
-        # 3. Create embeddings and vector store
-        embeddings = load_embeddings()
-        vector_store = FAISS.from_documents(texts, embeddings)
+        # 3. Create embeddings and the vector store
+        embeddings_model = load_embeddings()
+        vector_store = FAISS.from_documents(texts, embeddings_model)
 
-        # Clean up the temporary file
-        os.remove(temp_file_path)
+        os.remove(temp_file_path) # Clean up the temp file
         
         return vector_store
     return None
 
 # --- Streamlit UI ---
-st.sidebar.header("Instructions")
+st.sidebar.title("About")
 st.sidebar.info(
-    "1. Make sure you have a Hugging Face API Token.\n"
-    "2. Upload a PDF document.\n"
-    "3. Wait for the document to be processed.\n"
-    "4. Ask a question about the document's content."
+    "This app uses a Retrieval-Augmented Generation (RAG) pipeline to answer questions about a PDF you upload. "
+    "It finds the most relevant text chunks from the document and uses an LLM to generate an answer.\n\n"
+    "**Tech Stack:**\n- Streamlit\n- LangChain\n- Hugging Face\n- FAISS"
 )
+# TODO: Add support for more document types like .txt and .docx
+st.sidebar.markdown("---")
+
 
 uploaded_file = st.file_uploader("Upload your PDF document", type="pdf")
 
 if uploaded_file:
     vector_store = process_pdf(uploaded_file)
     if vector_store:
-        st.success(f"Document '{uploaded_file.name}' processed successfully!")
+        st.success(f"Document '{uploaded_file.name}' is ready for questions!")
         
-        # Initialize the QA chain
-        qa_chain = RetrievalQA.from_chain_type(
+        rag_chain = RetrievalQA.from_chain_type(
             llm=load_llm(),
-            chain_type="stuff",
-            retriever=vector_store.as_retriever(search_kwargs={"k": 2})
+            chain_type="stuff", # "stuff" is a simple chain type, good for smaller docs
+            retriever=vector_store.as_retriever(search_kwargs={"k": 3}) # find top 3 relevant chunks
         )
 
-        # Chat interface
-        question = st.text_input("Ask a question about the document:", placeholder="What is the main topic of this document?")
+        question = st.text_input(
+            "Ask a question about the document:",
+            placeholder="What is the main conclusion of this paper?"
+        )
 
         if st.button("Get Answer"):
             if question:
-                with st.spinner("Finding the answer..."):
+                print(f"User question: {question}") # A print statement for debugging
+                with st.spinner("Searching for the answer..."):
                     try:
-                        result = qa_chain.invoke({"query": question})
+                        result = rag_chain.invoke({"query": question})
                         st.subheader("Answer:")
                         st.write(result['result'])
                     except Exception as e:
-                        st.error(f"An error occurred: {e}")
+                        st.error(f"Something went wrong: {e}")
             else:
-                st.warning("Please enter a question.")
+                st.warning("Please ask a question first!")
 else:
-    st.info("Please upload a PDF to begin.")
+    st.info("Upload a PDF to get started.")
